@@ -8,6 +8,54 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model Message {
+  id         String        @id @default(uuid())
+  channel    String
+  recipients String[]
+  body       String
+  metadata   Json?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  status     MessageStatus @default(PENDING)
+
+  @@index([channel])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model SlackMessage {
+  id          String             @id @default(uuid())
+  messageId   String             @unique
+  recipient   String
+  body        String
+  mediaUrl    String?
+  status      SlackMessageStatus @default(PENDING)
+  slackMsgTs  String?
+  channel     String?
+  errorReason String?
+  sentAt      DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+}
+
+enum MessageStatus {
+  PENDING
+  SENT
+  FAILED
+  PARTIAL
+}
+
+enum SlackMessageStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
 // ─── Pre-existing tables (never drop) ────────────────────────────────────────
 
 model days_off {
