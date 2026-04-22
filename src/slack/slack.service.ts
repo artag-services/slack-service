@@ -242,39 +242,41 @@ export class SlackService {
   }
 
   /**
-   * Log an event to the Message table for audit trail
-   * Used by event handlers to record webhook events
-   * 
-   * @param eventType - Type of event
-   * @param channel - Channel/user ID
-   * @param body - Event description or message content
-   * @param metadata - Full event payload for audit
-   */
-  async logEventToMessages(
-    eventType: string,
-    channel: string,
-    body: string,
-    metadata?: Record<string, unknown>,
-  ): Promise<void> {
-    try {
-      await this.prisma.message.create({
-        data: {
-          id: uuidv4(),
-          channel,
-          recipients: [channel], // Single channel as recipient
-          body: `[${eventType}] ${body}`,
-          metadata: metadata ? JSON.parse(JSON.stringify(metadata)) : null,
-          status: 'SENT',
-        },
-      });
+    * Log an event to the SlackMessage table for audit trail
+    * Used by event handlers to record webhook events
+    * 
+    * @param eventType - Type of event
+    * @param channel - Channel/user ID
+    * @param body - Event description or message content
+    * @param metadata - Full event payload for audit (stored in mediaUrl as JSON string for now)
+    */
+   async logEventToMessages(
+     eventType: string,
+     channel: string,
+     body: string,
+     metadata?: Record<string, unknown>,
+   ): Promise<void> {
+     try {
+       const messageId = uuidv4();
+       await this.prisma.slackMessage.create({
+         data: {
+           id: messageId,
+           messageId,
+           recipient: channel,
+           body: `[${eventType}] ${body}`,
+           mediaUrl: metadata ? JSON.stringify(metadata) : null,
+           status: 'SENT',
+           channel,
+         },
+       });
 
-      this.logger.debug(`Logged event [${eventType}] to Message table`);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Failed to log event to Message table: ${reason}`);
-      // Don't throw - logging failure shouldn't break event processing
-    }
-  }
+       this.logger.debug(`Logged event [${eventType}] to SlackMessage table`);
+     } catch (error) {
+       const reason = error instanceof Error ? error.message : String(error);
+       this.logger.error(`Failed to log event to SlackMessage table: ${reason}`);
+       // Don't throw - logging failure shouldn't break event processing
+     }
+   }
 
   /**
    * Post a reply to a Slack thread
