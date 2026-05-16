@@ -1,44 +1,70 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { WebClient, ChatPostMessageResponse, ChatScheduleMessageResponse } from '@slack/web-api';
-import { PrismaService } from '../prisma/prisma.service';
-import { SendSlackDto } from './dto/send-slack.dto';
-import { SlackResponseDto } from './dto/slack-response.dto';
-import { v4 as uuidv4 } from 'uuid';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common'
+import { ConfigService } from '@nestjs/config'
+import {
+  WebClient,
+  ChatPostMessageResponse,
+  ChatScheduleMessageResponse,
+  retryPolicies,
+} from '@slack/web-api'
+import { v4 as uuidv4 } from 'uuid'
 
+import { PrismaService } from '../prisma/prisma.service'
+import { SendSlackDto } from './dto/send-slack.dto'
+import { SlackResponseDto } from './dto/slack-response.dto'
+
+/**
+ * Slack microservice — outbound messaging + helper API ops.
+ *
+ * Uses the official `@slack/web-api` `WebClient`, which already handles:
+ *   - HTTP keep-alive (internal node-fetch agent)
+ *   - Automatic backoff/retries on 429 and 5xx
+ *
+ * So unlike the Meta-based services, we don't need a custom HTTP client.
+ * We just configure timeout + retries explicitly via env.
+ */
 @Injectable()
 export class SlackService {
-  private readonly logger = new Logger(SlackService.name);
-  private readonly client: WebClient;
+  private readonly logger = new Logger(SlackService.name)
+  private readonly client: WebClient
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
   ) {
-    const token = this.config.getOrThrow<string>('SLACK_BOT_TOKEN');
-    this.client = new WebClient(token);
+    const token = this.config.getOrThrow<string>('SLACK_BOT_TOKEN')
+    const timeoutMs = Number(this.config.get<string>('SLACK_API_TIMEOUT_MS') ?? 30_000)
+    const maxRetries = Number(this.config.get<string>('SLACK_API_MAX_RETRIES') ?? 3)
+
+    this.client = new WebClient(token, {
+      timeout: timeoutMs,
+      retryConfig: maxRetries === 0 ? retryPolicies.rapidRetryPolicy : { retries: maxRetries },
+    })
+
+    this.logger.log(`SlackService ready — timeout=${timeoutMs}ms retries=${maxRetries}`)
   }
 
-  // ─────────────────────────────────────────
-  // Enviar a múltiples destinatarios
-  // ─────────────────────────────────────────
+  // ─────────────── fan-out send ───────────────
 
   async sendToRecipients(dto: SendSlackDto): Promise<SlackResponseDto> {
     const results = await Promise.allSettled(
       dto.recipients.map((recipient) =>
         this.sendToOne(dto.messageId, recipient, dto.message, dto.mediaUrl),
       ),
-    );
+    )
 
     const errors = results
-      .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
-      .map((r, i) => ({
-        recipient: dto.recipients[i],
-        reason: r.reason instanceof Error ? r.reason.message : String(r.reason),
-      }));
+      .map((r, i) =>
+        r.status === 'rejected'
+          ? {
+              recipient: dto.recipients[i],
+              reason: r.reason instanceof Error ? r.reason.message : String(r.reason),
+            }
+          : null,
+      )
+      .filter((e): e is { recipient: string; reason: string } => e !== null)
 
-    const sentCount = results.filter((r) => r.status === 'fulfilled').length;
-    const failedCount = errors.length;
+    const sentCount = results.filter((r) => r.status === 'fulfilled').length
+    const failedCount = errors.length
 
     return {
       messageId: dto.messageId,
@@ -47,12 +73,10 @@ export class SlackService {
       failedCount,
       errors: errors.length > 0 ? errors : undefined,
       timestamp: new Date().toISOString(),
-    };
+    }
   }
 
-  // ─────────────────────────────────────────
-  // Enviar a un destinatario individual
-  // ─────────────────────────────────────────
+  // ─────────────── single send ───────────────
 
   private async sendToOne(
     messageId: string,
@@ -69,34 +93,19 @@ export class SlackService {
         mediaUrl: mediaUrl ?? null,
         status: 'PENDING',
       },
-    });
+    })
 
     try {
-      let response: ChatPostMessageResponse;
-
-      if (mediaUrl) {
-        // Send message with image block
-        response = await this.client.chat.postMessage({
-          channel: recipient,
-          text: message,
-          blocks: [
-            {
-              type: 'image',
-              image_url: mediaUrl,
-              alt_text: message,
-            },
-            {
-              type: 'section',
-              text: { type: 'mrkdwn', text: message },
-            },
-          ],
-        });
-      } else {
-        response = await this.client.chat.postMessage({
-          channel: recipient,
-          text: message,
-        });
-      }
+      const response: ChatPostMessageResponse = mediaUrl
+        ? await this.client.chat.postMessage({
+            channel: recipient,
+            text: message,
+            blocks: [
+              { type: 'image', image_url: mediaUrl, alt_text: message },
+              { type: 'section', text: { type: 'mrkdwn', text: message } },
+            ],
+          })
+        : await this.client.chat.postMessage({ channel: recipient, text: message })
 
       await this.prisma.slackMessage.update({
         where: { id: record.id },
@@ -106,45 +115,22 @@ export class SlackService {
           channel: response.channel ?? null,
           sentAt: new Date(),
         },
-      });
+      })
 
-      this.logger.log(`Sent to ${recipient} | ts: ${response.ts}`);
+      this.logger.log(`Sent to ${recipient} | ts=${response.ts}`)
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-
+      const reason = error instanceof Error ? error.message : String(error)
       await this.prisma.slackMessage.update({
         where: { id: record.id },
         data: { status: 'FAILED', errorReason: reason },
-      });
-
-      this.logger.error(`Failed to send to ${recipient}: ${reason}`);
-      throw new Error(reason);
+      })
+      this.logger.error(`Failed to send to ${recipient}: ${reason}`)
+      throw error instanceof Error ? error : new Error(reason)
     }
   }
 
-  // ─────────────────────────────────────────
-  // Helpers privados
-  // ─────────────────────────────────────────
+  // ─────────────── helper ops ───────────────
 
-  private resolveStatus(sent: number, failed: number): 'SENT' | 'FAILED' | 'PARTIAL' {
-    if (failed === 0) return 'SENT';
-    if (sent === 0) return 'FAILED';
-    return 'PARTIAL';
-  }
-
-  // ─────────────────────────────────────────
-  // Advanced Operations
-  // ─────────────────────────────────────────
-
-  /**
-   * Schedule a message to be sent at a specific time
-   * 
-   * @param channelId - Slack channel ID (C123... or @user)
-   * @param text - Message text
-   * @param postAt - Unix timestamp when to send (seconds)
-   * @param blocks - Optional Block Kit blocks for rich formatting
-   * @returns Scheduled message ID
-   */
   async scheduleMessage(
     channelId: string,
     text: string,
@@ -157,163 +143,78 @@ export class SlackService {
         text,
         post_at: postAt,
         blocks: blocks as any,
-      })) as ChatScheduleMessageResponse;
-
-      if (!response.ok) {
-        throw new Error(response.error || 'Unknown error');
-      }
-
+      })) as ChatScheduleMessageResponse
+      if (!response.ok) throw new Error(response.error || 'Unknown error')
       this.logger.log(
-        `Scheduled message in ${channelId} | scheduled_message_id: ${response.scheduled_message_id}`,
-      );
-
-      return response.scheduled_message_id as string;
+        `Scheduled in ${channelId} | scheduled_message_id=${response.scheduled_message_id}`,
+      )
+      return response.scheduled_message_id as string
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Failed to schedule message: ${reason}`);
-      throw new BadRequestException(`Failed to schedule message: ${reason}`);
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new BadRequestException(`Failed to schedule message: ${reason}`)
     }
   }
 
-  /**
-   * Add an emoji reaction to a message
-   * 
-   * @param emoji - Emoji name (without colons, e.g. "thumbsup", "heart")
-   * @param channelId - Slack channel ID
-   * @param messageTs - Message timestamp (ts value from message)
-   */
-  async addReaction(
-    emoji: string,
-    channelId: string,
-    messageTs: string,
-  ): Promise<void> {
+  async addReaction(emoji: string, channelId: string, messageTs: string): Promise<void> {
     try {
       const response = await this.client.reactions.add({
         name: emoji,
         channel: channelId,
         timestamp: messageTs,
-      });
-
-      if (!response.ok) {
-        throw new Error(response.error || 'Unknown error');
-      }
-
-      this.logger.log(
-        `Added reaction :${emoji}: to message in ${channelId} (ts: ${messageTs})`,
-      );
+      })
+      if (!response.ok) throw new Error(response.error || 'Unknown error')
+      this.logger.log(`Added :${emoji}: in ${channelId} (ts=${messageTs})`)
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Failed to add reaction: ${reason}`);
-      throw new BadRequestException(`Failed to add reaction: ${reason}`);
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new BadRequestException(`Failed to add reaction: ${reason}`)
     }
   }
 
-  /**
-   * Remove an emoji reaction from a message
-   * 
-   * @param emoji - Emoji name (without colons, e.g. "thumbsup", "heart")
-   * @param channelId - Slack channel ID
-   * @param messageTs - Message timestamp
-   */
-  async removeReaction(
-    emoji: string,
-    channelId: string,
-    messageTs: string,
-  ): Promise<void> {
+  async removeReaction(emoji: string, channelId: string, messageTs: string): Promise<void> {
     try {
       const response = await this.client.reactions.remove({
         name: emoji,
         channel: channelId,
         timestamp: messageTs,
-      });
-
-      if (!response.ok) {
-        throw new Error(response.error || 'Unknown error');
-      }
-
-      this.logger.log(
-        `Removed reaction :${emoji}: from message in ${channelId}`,
-      );
+      })
+      if (!response.ok) throw new Error(response.error || 'Unknown error')
+      this.logger.log(`Removed :${emoji}: from ${channelId}`)
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Failed to remove reaction: ${reason}`);
-      throw new BadRequestException(`Failed to remove reaction: ${reason}`);
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new BadRequestException(`Failed to remove reaction: ${reason}`)
     }
   }
 
-  /**
-    * Log an event to the SlackMessage table for audit trail
-    * Used by event handlers to record webhook events
-    * 
-    * @param eventType - Type of event
-    * @param channel - Channel/user ID
-    * @param body - Event description or message content
-    * @param metadata - Full event payload for audit (stored in mediaUrl as JSON string for now)
-    */
-   async logEventToMessages(
-     eventType: string,
-     channel: string,
-     body: string,
-     metadata?: Record<string, unknown>,
-   ): Promise<void> {
-     try {
-       const messageId = uuidv4();
-       await this.prisma.slackMessage.create({
-         data: {
-           id: messageId,
-           messageId,
-           recipient: channel,
-           body: `[${eventType}] ${body}`,
-           mediaUrl: metadata ? JSON.stringify(metadata) : null,
-           status: 'SENT',
-           channel,
-         },
-       });
-
-       this.logger.debug(`Logged event [${eventType}] to SlackMessage table`);
-     } catch (error) {
-       const reason = error instanceof Error ? error.message : String(error);
-       this.logger.error(`Failed to log event to SlackMessage table: ${reason}`);
-       // Don't throw - logging failure shouldn't break event processing
-     }
-   }
-
-  /**
-   * Post a reply to a Slack thread
-   * 
-   * @param channelId - Channel ID where the thread exists
-   * @param text - Reply text
-   * @param threadTs - Timestamp of the parent message
-   * @param replyBroadcast - Whether to also post in channel
-   */
   async postThreadReply(
     channelId: string,
     text: string,
     threadTs: string,
     replyBroadcast = false,
   ): Promise<ChatPostMessageResponse> {
+    if (!threadTs) {
+      throw new BadRequestException('postThreadReply requires a non-empty threadTs')
+    }
     try {
       const response = await this.client.chat.postMessage({
         channel: channelId,
         text,
         thread_ts: threadTs,
         reply_broadcast: replyBroadcast,
-      });
-
-      if (!response.ok) {
-        throw new Error(response.error || 'Unknown error');
-      }
-
-      this.logger.log(
-        `Posted thread reply in ${channelId} (thread_ts: ${threadTs})`,
-      );
-
-      return response;
+      })
+      if (!response.ok) throw new Error(response.error || 'Unknown error')
+      this.logger.log(`Thread reply in ${channelId} (thread_ts=${threadTs})`)
+      return response
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Failed to post thread reply: ${reason}`);
-      throw new BadRequestException(`Failed to post thread reply: ${reason}`);
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new BadRequestException(`Failed to post thread reply: ${reason}`)
     }
-   }
-}
+  }
 
+  // ─────────────── helpers ───────────────
+
+  private resolveStatus(sent: number, failed: number): 'SENT' | 'FAILED' | 'PARTIAL' {
+    if (failed === 0) return 'SENT'
+    if (sent === 0) return 'FAILED'
+    return 'PARTIAL'
+  }
+}
