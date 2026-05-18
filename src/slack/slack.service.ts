@@ -9,8 +9,16 @@ import {
 import { v4 as uuidv4 } from 'uuid'
 
 import { PrismaService } from '../prisma/prisma.service'
+import { RabbitMQService } from '../rabbitmq/rabbitmq.service'
 import { SendSlackDto } from './dto/send-slack.dto'
 import { SlackResponseDto } from './dto/slack-response.dto'
+
+/**
+ * CQRS event routing key. The sync-service projects this into the
+ * UnifiedMessage collection (with sender='BOT', channel='slack') so the
+ * gateway's read endpoints can return a cross-channel history.
+ */
+const DATA_EVENT_MESSAGE_SENT = 'data.slack.message.sent'
 
 /**
  * Slack microservice — outbound messaging + helper API ops.
@@ -30,6 +38,7 @@ export class SlackService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly rabbitmq: RabbitMQService,
   ) {
     const token = this.config.getOrThrow<string>('SLACK_BOT_TOKEN')
     const timeoutMs = Number(this.config.get<string>('SLACK_API_TIMEOUT_MS') ?? 30_000)
@@ -107,7 +116,7 @@ export class SlackService {
           })
         : await this.client.chat.postMessage({ channel: recipient, text: message })
 
-      await this.prisma.slackMessage.update({
+      const updated = await this.prisma.slackMessage.update({
         where: { id: record.id },
         data: {
           status: 'SENT',
@@ -118,14 +127,68 @@ export class SlackService {
       })
 
       this.logger.log(`Sent to ${recipient} | ts=${response.ts}`)
+
+      // CQRS: announce to the read model. Runs AFTER Postgres has committed.
+      this.publishMessageSent({
+        messageId: updated.id,
+        externalMessageId: updated.slackMsgTs,
+        recipient: updated.recipient,
+        channelUserId: updated.channel ?? updated.recipient,
+        content: updated.body,
+        mediaUrl: updated.mediaUrl,
+        sentAt: updated.sentAt ?? new Date(),
+      })
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      await this.prisma.slackMessage.update({
+      const failed = await this.prisma.slackMessage.update({
         where: { id: record.id },
         data: { status: 'FAILED', errorReason: reason },
       })
+
+      // Even failed sends are projected — the read model knows we tried.
+      // sender='BOT' but content/recipient still useful for debugging.
+      this.publishMessageSent({
+        messageId: failed.id,
+        externalMessageId: null,
+        recipient: failed.recipient,
+        channelUserId: failed.recipient,
+        content: failed.body,
+        mediaUrl: failed.mediaUrl,
+        sentAt: failed.updatedAt,
+      })
+
       this.logger.error(`Failed to send to ${recipient}: ${reason}`)
       throw error instanceof Error ? error : new Error(reason)
+    }
+  }
+
+  /**
+   * Emit `data.slack.message.sent` for the CQRS read model. Best-effort —
+   * a publish failure logs a warning but never breaks the caller.
+   */
+  private publishMessageSent(args: {
+    messageId: string
+    externalMessageId?: string | null
+    recipient: string
+    channelUserId?: string | null
+    content: string
+    mediaUrl?: string | null
+    sentAt: Date
+  }): void {
+    try {
+      this.rabbitmq.publish(DATA_EVENT_MESSAGE_SENT, {
+        messageId: args.messageId,
+        externalMessageId: args.externalMessageId ?? null,
+        recipient: args.recipient,
+        channelUserId: args.channelUserId ?? args.recipient,
+        content: args.content,
+        mediaUrl: args.mediaUrl ?? null,
+        timestamp: args.sentAt.toISOString(),
+      })
+    } catch (err) {
+      this.logger.warn(
+        `Failed to publish ${DATA_EVENT_MESSAGE_SENT} for ${args.messageId}: ${(err as Error).message}`,
+      )
     }
   }
 
